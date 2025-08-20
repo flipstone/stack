@@ -443,7 +443,7 @@ loadLocalPackage pp = do
     componentFiles' <- runMemoizedWith componentFiles
     forM (Map.toList componentFiles') $ \(component, files) -> do
       mbuildCache <- tryGetBuildCache (ppRoot pp) component
-      checkCacheResult <- checkBuildCache
+      checkCacheResult <- checkBuildCache name
         (fromMaybe Map.empty mbuildCache)
         (Set.toList files)
       pure (component, checkCacheResult)
@@ -488,10 +488,11 @@ loadLocalPackage pp = do
 -- determine (1) if the files are dirty, and (2) the new cache values.
 checkBuildCache ::
      HasEnvConfig env
-  => Map FilePath FileCacheInfo -- ^ old cache
+  => PackageName
+  -> Map FilePath FileCacheInfo -- ^ old cache
   -> [Path Abs File] -- ^ files in package
   -> RIO env (Set FilePath, Map FilePath FileCacheInfo)
-checkBuildCache oldCache files = do
+checkBuildCache pkgName oldCache files = do
   fileDigests <- fmap Map.fromList $ forM files $ \fp -> do
     mdigest <- getFileDigestMaybe (toFilePath fp)
     pure (toFilePath fp, mdigest)
@@ -510,6 +511,8 @@ checkBuildCache oldCache files = do
     -> RIO env (Set FilePath, Map FilePath FileCacheInfo)
   -- Filter out the cabal_macros file to avoid spurious recompilations
   go fp _ _ | takeFileName fp == "cabal_macros.h" = pure (Set.empty, Map.empty)
+  -- Filter out the Paths_<pkg name> file to avoid spurious recompilations
+  go fp _ _ | takeFileName fp == "Paths_" ++ packageNameString pkgName ++ ".hs" = pure (Set.empty, Map.empty)
   -- Common case where it's in the cache and on the filesystem.
   go fp (Just digest') (Just fci)
       | fci.hash == digest' = pure (Set.empty, Map.singleton fp fci)
