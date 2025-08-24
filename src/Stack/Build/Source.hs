@@ -512,7 +512,7 @@ checkBuildCache pkgName oldCache files = do
   -- Filter out the cabal_macros file to avoid spurious recompilations
   go fp _ _ | takeFileName fp == "cabal_macros.h" = pure (Set.empty, Map.empty)
   -- Filter out the Paths_<pkg name> file to avoid spurious recompilations
-  go fp _ _ | takeFileName fp == "Paths_" ++ packageNameString pkgName ++ ".hs" = pure (Set.empty, Map.empty)
+  go fp _ _ | takeFileName fp == pathsFile = pure (Set.empty, Map.empty)
   -- Common case where it's in the cache and on the filesystem.
   go fp (Just digest') (Just fci)
       | fci.hash == digest' = pure (Set.empty, Map.singleton fp fci)
@@ -523,6 +523,14 @@ checkBuildCache pkgName oldCache files = do
   -- Missing cache. Add it to dirty files and compute FileCacheInfo.
   go fp (Just digest') Nothing =
     pure (Set.singleton fp, Map.singleton fp $ FileCacheInfo digest')
+
+  pathsFile =
+    "Paths_" ++ map fixPathsFileChar (packageNameString pkgName) ++ ".hs"
+
+  -- cabal doesn't currently expose this logic from
+  -- Distribution.Simple.Build.PathsModule
+  fixPathsFileChar '-' = '_'
+  fixPathsFileChar c = c
 
 -- | Returns entries to add to the build cache for any newly found unlisted
 -- modules
