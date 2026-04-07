@@ -27,6 +27,14 @@ Other enhancements:
   request termination of a timed-out test suite process and, after the specified
   grace period, force termination. Used together with the existing
   `--test-suite-timeout=SECONDS` option.
+* In YAML configuration files (`stack.yaml` and `config.yaml`), the `!include`
+  YAML directive is now supported, allowing common configuration to be shared
+  across multiple files. For example, projects that maintain multiple
+  `stack.yaml` files for testing against different snapshots can use `!include`
+  to avoid duplicating shared settings.
+* Stack's `config set` command now raises an error (message S-6088) if the
+  target configuration file contains `!include` directives, as the command
+  cannot safely modify such files.
 
 Bug fixes:
 
