@@ -147,6 +147,9 @@ data ExecuteEnv = ExecuteEnv
     -- ^ For nicer interleaved output: track the largest package name size
   , pathEnvVar :: !Text
     -- ^ Value of the PATH environment variable
+  , needsRecache :: !(TVar Bool)
+    -- ^ Whether the snapshot package database needs a ghc-pkg recache due to
+    -- .conf files being copied directly (rather than via ghc-pkg register).
   }
 
 -- | Type representing setup executable circumstances.
@@ -330,6 +333,7 @@ withExecuteEnv
       logFiles <- liftIO $ atomically newTChan
       let totalWanted = length $ filter (.wanted) locals
       pathEnvVar <- liftIO $ maybe mempty T.pack <$> lookupEnv "PATH"
+      needsRecache <- liftIO $ newTVarIO False
       inner ExecuteEnv
         { buildOpts
         , buildOptsCLI
@@ -355,6 +359,7 @@ withExecuteEnv
         , customBuilt
         , largestPackageName
         , pathEnvVar
+        , needsRecache
         } `finally` dumpLogs logFiles totalWanted
  where
   toDumpPackagesByGhcPkgId = Map.fromList . map (\dp -> (dp.ghcPkgId, dp))

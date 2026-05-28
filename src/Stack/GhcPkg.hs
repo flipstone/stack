@@ -17,7 +17,9 @@ module Stack.GhcPkg
   , ghcPkg
   , ghcPkgPathEnvVar
   , mkGhcPackagePath
+  , recachePackageDb
   , unregisterGhcPkgIds
+  , unregisterGhcPkgIdsNoRecache
   ) where
 
 import qualified Data.ByteString.Char8 as S8
@@ -199,6 +201,30 @@ unregisterGhcPkgIds isWarn pkgexe pkgDb epgids = do
   hasIpid = not (null gids)
   pkgarg_strs = map packageIdentifierString idents <> map ghcPkgIdString gids
 
+-- | Like 'unregisterGhcPkgIds' but without running @ghc-pkg recache@
+-- afterwards. Use this when a batch recache will be performed later.
+unregisterGhcPkgIdsNoRecache ::
+     (HasCompiler env, HasTerm env)
+  => Path Abs Dir -- ^ package database
+  -> NonEmpty (Either PackageIdentifier GhcPkgId)
+  -> RIO env ()
+unregisterGhcPkgIdsNoRecache pkgDb epgids = do
+  globalDb <- view $ compilerPathsL . to (.globalDB)
+  try (ghcPkgUnregisterForce globalDb pkgDb hasIpid pkgarg_strs) >>= \case
+    Left (PrettyException e) ->
+      prettyDebug $
+        "[S-8729]"
+        <> line
+        <> flow "While unregistering packages, Stack encountered the following \
+                \error:"
+        <> blankLine
+        <> pretty e
+    Right _ -> pure ()
+ where
+  (idents, gids) = partitionEithers $ toList epgids
+  hasIpid = not (null gids)
+  pkgarg_strs = map packageIdentifierString idents <> map ghcPkgIdString gids
+
 -- | Get the value for GHC_PACKAGE_PATH
 mkGhcPackagePath :: Bool -> Path Abs Dir -> Path Abs Dir -> [Path Abs Dir] -> Path Abs Dir -> Text
 mkGhcPackagePath locals localdb deps extras globaldb =
@@ -208,3 +234,16 @@ mkGhcPackagePath locals localdb deps extras globaldb =
     , [toFilePathNoTrailingSep db | db <- reverse extras]
     , [toFilePathNoTrailingSep globaldb]
     ]
+
+-- | Run @ghc-pkg recache@ on the given package database. This regenerates
+-- the @package.cache@ file from the .conf files present in the database
+-- directory.
+recachePackageDb ::
+     (HasProcessContext env, HasTerm env)
+  => GhcPkgExe
+  -> Path Abs Dir
+  -> RIO env ()
+recachePackageDb pkgexe pkgDb =
+  ghcPkg pkgexe [pkgDb] ["recache"] >>= \case
+    Left err -> prettyThrowM $ CannotRecacheAfterUnregister pkgDb err
+    Right _ -> pure ()

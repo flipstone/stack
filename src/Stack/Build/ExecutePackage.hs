@@ -52,7 +52,7 @@ import           RIO.Process
                    ( HasProcessContext, byteStringInput, findExecutable
                    , getStderr, getStdout, inherit, modifyEnvVars, proc
                    , setStderr, setStdin, setStdout, showProcessArgDebug
-                   , useHandleOpen, waitExitCode, withModifyEnvVars
+                   , useHandleOpen, waitExitCode
                    , withProcessWait, withWorkingDir
                    )
 import           Stack.Build.Cache
@@ -79,7 +79,8 @@ import           Stack.Constants.Config
                    , hpcRelativeDir, setupConfigFromDir
                    )
 import           Stack.Coverage ( generateHpcReport, updateTixFile )
-import           Stack.GhcPkg ( ghcPkg, ghcPkgPathEnvVar, unregisterGhcPkgIds )
+import           Stack.GhcPkg
+                   ( recachePackageDb, unregisterGhcPkgIdsNoRecache )
 import           Stack.Package
                    ( buildLogPath, buildableExes, buildableSubLibs
                    , hasBuildableMainLibrary
@@ -103,7 +104,7 @@ import           Stack.Types.CompCollection
                    , foldComponentToAnotherCollection, getBuildableListText
                    )
 import           Stack.Types.Compiler
-                   ( WhichCompiler (..), whichCompiler, whichCompilerL )
+                   ( WhichCompiler (..), whichCompilerL )
 import           Stack.Types.CompilerPaths
                    ( CompilerPaths (..), GhcPkgExe (..), HasCompiler (..)
                    , cpWhich, getGhcPkgExe
@@ -119,11 +120,12 @@ import           Stack.Types.ConfigureOpts
 import           Stack.Types.Curator ( Curator (..) )
 import           Stack.Types.DumpPackage ( DumpPackage (..) )
 import           Stack.Types.EnvConfig
-                   ( EnvConfig (..), HasEnvConfig (..), actualCompilerVersionL
+                   ( HasEnvConfig (..), actualCompilerVersionL
                    , appropriateGhcColorFlag
                    )
 import           Stack.Types.EnvSettings ( EnvSettings (..) )
-import           Stack.Types.GhcPkgId ( GhcPkgId, ghcPkgIdToText )
+import           Stack.Types.GhcPkgId
+                   ( GhcPkgId, ghcPkgIdToText, parseGhcPkgId )
 import           Stack.Types.GlobalOpts ( GlobalOpts (..) )
 import           Stack.Types.Installed
                    ( InstallLocation (..), Installed (..), InstalledMap
@@ -146,7 +148,7 @@ import           Stack.Types.Plan
                    , taskTypePackageIdentifier
                    )
 import           Stack.Types.Runner ( HasRunner, globalOptsL )
-import           Stack.Types.SourceMap ( SourceMap (..) )
+import qualified System.FilePath as FP
 import           System.IO.Error ( isDoesNotExistError )
 import           System.PosixCompat.Files
                    ( createLink, getFileStatus, modificationTime )
@@ -436,6 +438,8 @@ realConfigAndBuild
   = withSingleContext ac ee task.taskType allDepsMap Nothing $
       \package cabalFP pkgDir cabal0 announce _outputType -> do
         let cabal = cabal0 CloseOnException
+        -- Ensure any precompiled .conf files are visible before configure
+        ensureRecached ee
         _neededConfig <-
           ensureConfig
             cache
@@ -860,45 +864,26 @@ copyPreCompiled ee task pkgId (PrecompiledCache mlib subLibs exes) = do
       (Left pkgId <$ mlib)
       (map (Left . toPackageId . toMungedPackageId) subLibNames)
     allToRegister = mcons mlib subLibs
+    pkgDb = ee.baseConfigOpts.snapDB
 
-  unless (null allToRegister) $
-    withMVar ee.installLock $ \() -> do
-      -- We want to ignore the global and user package databases. ghc-pkg
-      -- allows us to specify --no-user-package-db and --package-db=<db> on
-      -- the command line.
-      let pkgDb = ee.baseConfigOpts.snapDB
-      ghcPkgExe <- getGhcPkgExe
-      -- First unregister, silently, everything that needs to be unregistered.
-      whenJust (nonEmpty allToUnregister) $ \allToUnregister' -> do
-        logLevel <- view $ globalOptsL . to (.logLevel)
-        let isDebug = logLevel == LevelDebug
-        catchAny
-          (unregisterGhcPkgIds isDebug ghcPkgExe pkgDb allToUnregister')
-          (const (pure ()))
-      -- There appears to be a bug in the ghc-pkg executable such that, on
-      -- Windows only, it cannot register a package into a package database that
-      -- is also listed in the GHC_PACKAGE_PATH environment variable. See:
-      -- https://gitlab.haskell.org/ghc/ghc/-/issues/25962. We work around that
-      -- by removing GHC_PACKAGE_PATH from the environment for the register
-      -- step.
-      wc <- view $ envConfigL . to (.sourceMap.compiler) . to whichCompiler
-      withModifyEnvVars (Map.delete $ ghcPkgPathEnvVar wc) $
-        forM_ allToRegister $ \libpath -> do
-          let args = ["register", "--force", toFilePath libpath]
-          ghcPkg ghcPkgExe [pkgDb] args >>= \case
-            Left e -> prettyWarn $
-              "[S-4541]"
-              <> line
-              <> fillSep
-                   [ flow "While registering"
-                   , pretty libpath
-                   , "in"
-                   , pretty pkgDb <> ","
-                   , flow "Stack encountered the following error:"
-                   ]
-              <> blankLine
-              <> string (displayException e)
-            Right _ -> pure ()
+  -- Unregister conflicting packages in-process (deletes .conf files, no
+  -- subprocess). This handles the "built with different flags" case.
+  whenJust (nonEmpty allToUnregister) $ \toUnregisterNE ->
+    catchAny
+      (unregisterGhcPkgIdsNoRecache pkgDb toUnregisterNE)
+      (const (pure ()))
+
+  -- Copy .conf files directly into the package database directory
+  unless (null allToRegister) $ do
+    ensureDir pkgDb
+    forM_ allToRegister $ \libpath -> do
+      let dst = pkgDb </> filename libpath
+      copyFile libpath dst
+
+  -- Signal that a recache is needed before any compilation step
+  liftIO $ atomically $ writeTVar ee.needsRecache True
+
+  -- Copy executables
   liftIO $ forM_ exes $ \exe -> do
     ensureDir bindir
     let dst = bindir </> filename exe
@@ -907,20 +892,33 @@ copyPreCompiled ee task pkgId (PrecompiledCache mlib subLibs exes) = do
     (Nothing, _:_) -> markExeInstalled (taskLocation task) pkgId
     _ -> pure ()
 
-  -- Find the package in the database
-  let pkgDbs = [ee.baseConfigOpts.snapDB]
-
+  -- Parse GhcPkgId from the .conf filename instead of calling ghc-pkg describe
   case mlib of
     Nothing -> pure $ Just $ Executable pkgId
-    Just _ -> do
-      mpkgid <- loadInstalledPkg pkgDbs ee.snapshotDumpPkgs pname
-
-      pure $ Just $
-        case mpkgid of
-          Nothing -> assert False $ Executable pkgId
-          Just pkgid -> simpleInstalledLib pkgId pkgid mempty
+    Just libpath -> do
+      let confFilename = toFilePath $ filename libpath
+          ghcPkgIdText = T.pack $ FP.dropExtension confFilename
+      gpkgId <- parseGhcPkgId ghcPkgIdText
+      pure $ Just $ simpleInstalledLib pkgId gpkgId mempty
  where
   bindir = ee.baseConfigOpts.snapInstallRoot </> bindirSuffix
+
+-- | Ensure the snapshot package database is recached if any precompiled .conf
+-- files have been copied into it. This must be called before any compilation
+-- step that needs to see those packages (e.g. before @cabal configure@).
+ensureRecached ::
+     (HasCompiler env, HasProcessContext env, HasTerm env)
+  => ExecuteEnv
+  -> RIO env ()
+ensureRecached ee = do
+  needed <- liftIO $ atomically $ do
+    val <- readTVar ee.needsRecache
+    when val $ writeTVar ee.needsRecache False
+    pure val
+  when needed $ withMVar ee.installLock $ \() -> do
+    ghcPkgExe <- getGhcPkgExe
+    let pkgDb = ee.baseConfigOpts.snapDB
+    recachePackageDb ghcPkgExe pkgDb
 
 loadInstalledPkg ::
      (HasCompiler env, HasProcessContext env, HasTerm env)
