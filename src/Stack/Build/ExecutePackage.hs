@@ -79,7 +79,10 @@ import           Stack.Constants.Config
                    , hpcRelativeDir, setupConfigFromDir
                    )
 import           Stack.Coverage ( generateHpcReport, updateTixFile )
-import           Stack.GhcPkg ( ghcPkg, ghcPkgPathEnvVar, unregisterGhcPkgIds )
+import           Stack.GhcPkg
+                   ( ghcPkg, ghcPkgPathEnvVar, registerIntoCache
+                   , unregisterGhcPkgIds
+                   )
 import           Stack.Package
                    ( buildLogPath, buildableExes, buildableSubLibs
                    , hasBuildableMainLibrary
@@ -855,12 +858,17 @@ copyPreCompiled ee task pkgId (PrecompiledCache mlib subLibs exes) = do
     toPackageId :: MungedPackageId -> PackageIdentifier
     toPackageId (MungedPackageId n v) =
       PackageIdentifier (encodeCompatPackageName n) v
+    pkgIdsToUnregister :: [PackageIdentifier]
+    pkgIdsToUnregister = mcons
+      (pkgId <$ mlib)
+      (map (toPackageId . toMungedPackageId) subLibNames)
     allToUnregister :: [Either PackageIdentifier GhcPkgId]
-    allToUnregister = mcons
-      (Left pkgId <$ mlib)
-      (map (Left . toPackageId . toMungedPackageId) subLibNames)
+    allToUnregister = map Left pkgIdsToUnregister
     allToRegister = mcons mlib subLibs
 
+  -- Unregister, register, and refresh the in-memory cache while holding the
+  -- install lock, which serialises mutations to the shared snapshot package
+  -- database (and its binary package.cache) across concurrent build threads.
   unless (null allToRegister) $
     withMVar ee.installLock $ \() -> do
       -- We want to ignore the global and user package databases. ghc-pkg
@@ -873,8 +881,9 @@ copyPreCompiled ee task pkgId (PrecompiledCache mlib subLibs exes) = do
         logLevel <- view $ globalOptsL . to (.logLevel)
         let isDebug = logLevel == LevelDebug
         catchAny
-          (unregisterGhcPkgIds isDebug ghcPkgExe pkgDb allToUnregister')
+          (unregisterGhcPkgIds isDebug ghcPkgExe ee.registeredConfs pkgDb allToUnregister')
           (const (pure ()))
+
       -- There appears to be a bug in the ghc-pkg executable such that, on
       -- Windows only, it cannot register a package into a package database that
       -- is also listed in the GHC_PACKAGE_PATH environment variable. See:
@@ -899,6 +908,10 @@ copyPreCompiled ee task pkgId (PrecompiledCache mlib subLibs exes) = do
               <> blankLine
               <> string (displayException e)
             Right _ -> pure ()
+      -- Update the in-memory cache with the newly registered .conf files.
+      let registeredPaths = map (\f -> pkgDb </> filename f) allToRegister
+      registerIntoCache ee.registeredConfs registeredPaths
+
   liftIO $ forM_ exes $ \exe -> do
     ensureDir bindir
     let dst = bindir </> filename exe

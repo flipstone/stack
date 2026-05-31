@@ -73,6 +73,7 @@ import           Stack.Constants
                    , relFileSetupMacrosH, setupGhciShimCode, stackProgName
                    )
 import           Stack.Constants.Config ( distDirFromDir, distRelativeDir )
+import           Stack.GhcPkg ( PackageDbCache, loadPackageDbCache )
 import           Stack.Package ( buildLogPath )
 import           Stack.Prelude
 import           Stack.Types.ApplyGhcOptions ( ApplyGhcOptions (..) )
@@ -147,6 +148,10 @@ data ExecuteEnv = ExecuteEnv
     -- ^ For nicer interleaved output: track the largest package name size
   , pathEnvVar :: !Text
     -- ^ Value of the PATH environment variable
+  , registeredConfs :: !(TVar PackageDbCache)
+    -- ^ In-memory cache of the snapshot package database's .conf files, used
+    -- to avoid expensive directory scans when unregistering packages during
+    -- precompiled cache copies.
   }
 
 -- | Type representing setup executable circumstances.
@@ -330,6 +335,7 @@ withExecuteEnv
       logFiles <- liftIO $ atomically newTChan
       let totalWanted = length $ filter (.wanted) locals
       pathEnvVar <- liftIO $ maybe mempty T.pack <$> lookupEnv "PATH"
+      registeredConfs <- loadPackageDbCache baseConfigOpts.snapDB
       inner ExecuteEnv
         { buildOpts
         , buildOptsCLI
@@ -355,6 +361,7 @@ withExecuteEnv
         , customBuilt
         , largestPackageName
         , pathEnvVar
+        , registeredConfs
         } `finally` dumpLogs logFiles totalWanted
  where
   toDumpPackagesByGhcPkgId = Map.fromList . map (\dp -> (dp.ghcPkgId, dp))

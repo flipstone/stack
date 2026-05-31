@@ -55,7 +55,7 @@ import           Stack.Coverage
                    ( deleteHpcReports, generateHpcMarkupIndex
                    , generateHpcUnifiedReport
                    )
-import           Stack.GhcPkg ( unregisterGhcPkgIds )
+import           Stack.GhcPkg ( loadPackageDbCache, unregisterGhcPkgIds )
 import           Stack.Prelude
 import           Stack.Types.Build
                    ( ExcludeTHLoading (..), KeepOutputOpen (..) )
@@ -547,10 +547,11 @@ unregisterPackages localDB ids = do
         Platform _ Windows -> 100
         _ -> 500
   let chunksOfNE size = mapMaybe nonEmpty . chunksOf size . NE.toList
+  cacheVar <- loadPackageDbCache localDB
   for_ (chunksOfNE batchSize ids) $ \batch -> do
     for_ batch $ \(_, (ident, reason)) -> logReason ident reason
     pkg <- getGhcPkgExe
-    unregisterGhcPkgIds True pkg localDB $ fmap (Right . fst) batch
+    unregisterGhcPkgIds True pkg cacheVar localDB $ fmap (Right . fst) batch
 
 toActions ::
      HasEnvConfig env
