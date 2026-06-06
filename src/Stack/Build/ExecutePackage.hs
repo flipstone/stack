@@ -851,17 +851,21 @@ copyPreCompiled ee task pkgId (PrecompiledCache mlib subLibs exes) = do
     subLibNames = Set.toList $ buildableSubLibs $ case task.taskType of
       TTLocalMutable lp -> lp.package
       TTRemotePackage _ p _ -> p
-    toMungedPackageId :: StackUnqualCompName -> MungedPackageId
-    toMungedPackageId subLib =
-      let subLibName = LSubLibName $ toCabalName subLib
-      in  MungedPackageId (MungedPackageName pname subLibName) pversion
-    toPackageId :: MungedPackageId -> PackageIdentifier
-    toPackageId (MungedPackageId n v) =
-      PackageIdentifier (encodeCompatPackageName n) v
+    -- The sub-library names paired with the munged package names under which
+    -- they are registered in the package database.
+    subLibsMungedNames :: [(StackUnqualCompName, PackageName)]
+    subLibsMungedNames =
+      let toMungedName subLib =
+            ( subLib
+            , encodeCompatPackageName $ toCabalMungedPackageName pname subLib
+            )
+      in  map toMungedName subLibNames
     allToUnregister :: [Either PackageIdentifier GhcPkgId]
     allToUnregister = mcons
       (Left pkgId <$ mlib)
-      (map (Left . toPackageId . toMungedPackageId) subLibNames)
+      (map
+         (\(_, mungedName) -> Left $ PackageIdentifier mungedName pversion)
+         subLibsMungedNames)
     allToRegister = mcons mlib subLibs
 
   unless (null allToRegister) $
@@ -918,10 +922,20 @@ copyPreCompiled ee task pkgId (PrecompiledCache mlib subLibs exes) = do
     Just _ -> do
       mpkgid <- loadInstalledPkg pkgDbs ee.snapshotDumpPkgs pname
 
-      pure $ Just $
-        case mpkgid of
-          Nothing -> assert False $ Executable pkgId
-          Just pkgid -> simpleInstalledLib pkgId pkgid mempty
+      case mpkgid of
+        Nothing -> pure $ Just $ assert False $ Executable pkgId
+        Just pkgid -> do
+          -- Gather the GhcPkgId values of the sub-libraries registered above,
+          -- so that the 'Installed' value (and, hence, the config caches of
+          -- packages that depend on this one) includes them, as it does when
+          -- the package is built from source (see
+          -- 'fetchAndMarkInstalledPackage') and when the package is loaded
+          -- from a package database (see 'Stack.Build.Installed').
+          subLibsPkgIds <- fmap (Map.fromList . catMaybes) $
+            forM subLibsMungedNames $ \(subLib, mungedName) -> do
+              mSubLibPkgId <- loadInstalledPkg pkgDbs ee.snapshotDumpPkgs mungedName
+              pure $ fmap (\subLibPkgId -> (subLib, subLibPkgId)) mSubLibPkgId
+          pure $ Just $ simpleInstalledLib pkgId pkgid subLibsPkgIds
  where
   bindir = ee.baseConfigOpts.snapInstallRoot </> bindirSuffix
 

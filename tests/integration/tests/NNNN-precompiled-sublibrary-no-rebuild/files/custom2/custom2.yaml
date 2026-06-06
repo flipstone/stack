@@ -1,0 +1,4 @@
+snapshot: ghc-9.10.3
+name: custom2
+packages:
+- archive: ../dep.tar.gz
